@@ -4,6 +4,10 @@
 #define SHARED_PROTOCOL_H
 
 #define INJECTOR_PROCESS_NAME   L"nanahira.exe"
+#define INJECTOR_PROCESS_NAME_A "nanahira.exe"
+
+#define SHM_SECTION_NAME_W L"\\BaseNamedObjects\\NanahiraSharedV4"
+#define SHM_SECTION_NAME_A "Global\\NanahiraSharedV4"
 
 #define PROTO_MAGIC             0xB3F1A7C9
 
@@ -13,10 +17,11 @@
 
 #define MAX_PAYLOAD_SIZE        (15 * 1024 * 1024)
 
-#define POLL_TIMEOUT_MS         10000
+#define POLL_TIMEOUT_MS         30000
 
 #define PROTO_VER_MAJOR         3
 #define PROTO_VER_MINOR         0
+#define PROTO_VER_PATCH         0
 
 typedef enum _IPC_COMMAND {
     IPC_CMD_NONE        = 0,

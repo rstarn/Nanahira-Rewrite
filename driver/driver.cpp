@@ -3,12 +3,39 @@
 #include "driver.h"
 
 static PVOID            g_SharedBuffer   = NULL;
-static PMDL             g_SharedMdl      = NULL;
-static PVOID            g_UserMappedVa   = NULL;
-static PEPROCESS        g_InjectorProc   = NULL;
+static HANDLE           g_ShmSection     = NULL;
+static HANDLE           g_SystemProcHandle = NULL;   // fallback mapping only
+static BOOLEAN          g_ViewInSystemSpace = FALSE;
 static HANDLE           g_WorkerThread   = NULL;
 static volatile BOOLEAN g_Shutdown       = FALSE;
 static SHARED_HEADER*   g_Header         = NULL;
+
+// Map the section into the system address space so the shared header is a
+// kernel-mode VA. A view mapped into a *user* process (the old
+// ZwMapViewOfSection(..., NtCurrentProcess(), ...) call) is only valid in the
+// process context where DriverEntry happened to run, which for a manual map
+// is the mapper. The system worker thread then writes to an unallocated user
+// address -> MEMORY_MANAGEMENT 0x1A / 0x4477.
+extern "C" {
+NTKERNELAPI NTSTATUS MmMapViewInSystemSpace(
+    _In_    PVOID   Section,
+    _Out_   PVOID*  MappedBase,
+    _Inout_ PSIZE_T ViewSize
+);
+NTKERNELAPI NTSTATUS MmUnmapViewInSystemSpace(_In_ PVOID MappedBase);
+}
+
+// The mapper's safety gate refuses to release any image that imports a
+// callback-registration API. This driver runs a system thread out of its own
+// image, so it must never be freed. The call is real in the import table but
+// gated behind a value that is always FALSE, so it is never executed.
+static volatile BOOLEAN g_NeverFreeMarker = FALSE;
+
+static VOID KeepResidentMarker(VOID)
+{
+    if (g_NeverFreeMarker)
+        (VOID)PsSetLoadImageNotifyRoutine(NULL);
+}
 static KEVENT           g_InjMutex;
 
 fn_MmCopyVirtualMemory     pfnMmCopyVirtualMemory    = NULL;
@@ -110,7 +137,8 @@ VOID HideVadNode(_In_ PEPROCESS Process, _In_ PVOID BaseAddress)
 
         ULONG_PTR targetVpn = (ULONG_PTR)BaseAddress >> PAGE_SHIFT;
 
-        while (node) {
+        for (ULONG depth = 0; node && depth < 64; ++depth) {
+            if (!MmIsAddressValid(node)) break;
             PMMVAD_SHORT vad = (PMMVAD_SHORT)node;
 
             ULONG_PTR startVpn = ((ULONG64)vad->StartingVpnHigh << 32) | vad->StartingVpn;
@@ -124,129 +152,180 @@ VOID HideVadNode(_In_ PEPROCESS Process, _In_ PVOID BaseAddress)
                 break;
             }
 
-            node = (targetVpn < startVpn) ? node->Left : node->Right;
+            PMM_AVL_NODE next = (targetVpn < startVpn) ? node->Left : node->Right;
+            if (next == node) break;   // defensive: never loop on self
+            node = next;
         }
     }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// The section is created from the elevated mapper's token, whose default DACL
+// denies write access to the non-elevated injector. Give Everyone full access
+// so any process in the session can map it read/write.
+static PVOID BuildWorldSecurityDescriptor(OUT PULONG OutSize)
+{
+    UCHAR sidBuf[12];
+    SID* sid = (SID*)sidBuf;
+    sid->Revision = SID_REVISION;
+    sid->SubAuthorityCount = 1;
+    RtlZeroMemory(sid->IdentifierAuthority.Value, sizeof(sid->IdentifierAuthority.Value));
+    sid->IdentifierAuthority.Value[5] = 1;   // SECURITY_WORLD_SID_AUTHORITY
+    sid->SubAuthority[0] = 0;                // Everyone (S-1-1-0)
+
+    UCHAR aclBuf[256];
+    ACL* acl = (ACL*)aclBuf;
+    if (!NT_SUCCESS(RtlCreateAcl(acl, sizeof(aclBuf), ACL_REVISION)))
+        return NULL;
+    if (!NT_SUCCESS(RtlAddAccessAllowedAce(
+            acl, ACL_REVISION, SECTION_ALL_ACCESS, sid)))
+        return NULL;
+
+    SECURITY_DESCRIPTOR abs;
+    if (!NT_SUCCESS(RtlCreateSecurityDescriptor(&abs, SECURITY_DESCRIPTOR_REVISION)))
+        return NULL;
+    if (!NT_SUCCESS(RtlSetDaclSecurityDescriptor(&abs, TRUE, acl, FALSE)))
+        return NULL;
+
+    ULONG len = 0;
+    NTSTATUS st = RtlAbsoluteToSelfRelativeSD(&abs, NULL, &len);
+    if (st != STATUS_BUFFER_TOO_SMALL || len == 0)
+        return NULL;
+
+    PVOID self = ExAllocatePool2(POOL_FLAG_PAGED, len, DRV_POOL_TAG);
+    if (!self) return NULL;
+    if (!NT_SUCCESS(RtlAbsoluteToSelfRelativeSD(&abs, self, &len))) {
+        ExFreePoolWithTag(self, DRV_POOL_TAG);
+        return NULL;
+    }
+    *OutSize = len;
+    return self;
+}
+
+static BOOLEAN SharedHeaderValid(VOID)
+{
+    return (g_Header != NULL) &&
+           (g_Header->Magic   == PROTO_MAGIC) &&
+           (g_Header->Version == ((PROTO_VER_MAJOR << 16) | PROTO_VER_MINOR));
+}
+
 NTSTATUS CreateSharedMemory(VOID)
 {
+    LARGE_INTEGER size;
+    size.QuadPart = SHM_TOTAL_SIZE;
 
-    g_SharedBuffer = ExAllocatePool2(
-        POOL_FLAG_NON_PAGED,
-        SHM_TOTAL_SIZE, DRV_POOL_TAG
-    );
-    if (!g_SharedBuffer) return STATUS_INSUFFICIENT_RESOURCES;
+    UNICODE_STRING name;
+    OBJECT_ATTRIBUTES oa;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
 
-    g_SharedMdl = IoAllocateMdl(g_SharedBuffer, (ULONG)SHM_TOTAL_SIZE, FALSE, FALSE, NULL);
-    if (!g_SharedMdl) {
-        ExFreePoolWithTag(g_SharedBuffer, DRV_POOL_TAG);
-        g_SharedBuffer = NULL;
-        return STATUS_INSUFFICIENT_RESOURCES;
+    ULONG sdLen = 0;
+    PVOID sd = BuildWorldSecurityDescriptor(&sdLen);
+
+    // SHM_SECTION_NAME_W is \BaseNamedObjects\<name>, which is exactly the
+    // object the Win32 "Global\<name>" open resolves to. It is randomized in
+    // lockstep with the usermode macro by source_randomizer.ps1.
+    RtlInitUnicodeString(&name, SHM_SECTION_NAME_W);
+    InitializeObjectAttributes(&oa, &name,
+        OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, sd);
+
+    status = ZwCreateSection(
+        &g_ShmSection, SECTION_ALL_ACCESS, &oa, &size,
+        PAGE_READWRITE, SEC_COMMIT, NULL);
+    if (status == STATUS_OBJECT_NAME_COLLISION) {
+        status = ZwOpenSection(&g_ShmSection, SECTION_ALL_ACCESS, &oa);
+    }
+    if (sd) ExFreePoolWithTag(sd, DRV_POOL_TAG);
+
+    if (!NT_SUCCESS(status)) {
+        DRV_ERR("[drv] ZwCreateSection failed: 0x%08X\n", status);
+        return status;
     }
 
-    MmBuildMdlForNonPagedPool(g_SharedMdl);
+    PVOID  base     = NULL;
+    SIZE_T viewSize = SHM_TOTAL_SIZE;
+    g_ViewInSystemSpace = FALSE;
 
-    g_Header            = (SHARED_HEADER*)g_SharedBuffer;
-    g_Header->Magic     = PROTO_MAGIC;
-    g_Header->Version   = (PROTO_VER_MAJOR << 16) | PROTO_VER_MINOR;
+    // Preferred: system-space view, valid in ANY process context.
+    PVOID sectionObject = NULL;
+    status = ObReferenceObjectByHandle(
+        g_ShmSection, SECTION_MAP_READ | SECTION_MAP_WRITE,
+        NULL, KernelMode, &sectionObject, NULL);
+    if (NT_SUCCESS(status)) {
+        status = MmMapViewInSystemSpace(sectionObject, &base, &viewSize);
+        ObDereferenceObject(sectionObject);
+    }
+
+    if (NT_SUCCESS(status) && base && viewSize >= sizeof(SHARED_HEADER)) {
+        g_ViewInSystemSpace = TRUE;
+    } else {
+        // Fallback: map explicitly into the System process (PID 4) instead of
+        // NtCurrentProcess(), which is the mapper during manual mapping.
+        CLIENT_ID cid = { (HANDLE)(ULONG_PTR)4, NULL };
+        OBJECT_ATTRIBUTES poa;
+        InitializeObjectAttributes(&poa, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+        viewSize = 0;
+        status = ZwOpenProcess(&g_SystemProcHandle, PROCESS_ALL_ACCESS, &poa, &cid);
+        if (NT_SUCCESS(status)) {
+            LARGE_INTEGER off = { 0 };
+            status = ZwMapViewOfSection(
+                g_ShmSection, g_SystemProcHandle, &base,
+                0, 0, &off, &viewSize, ViewShare, 0, PAGE_READWRITE);
+        }
+        if (!NT_SUCCESS(status) || !base || viewSize < sizeof(SHARED_HEADER)) {
+            if (g_SystemProcHandle) {
+                ZwClose(g_SystemProcHandle);
+                g_SystemProcHandle = NULL;
+            }
+            if (base) ZwUnmapViewOfSection(NtCurrentProcess(), base);
+            ZwClose(g_ShmSection);
+            g_ShmSection = NULL;
+            DRV_ERR("[drv] shared view mapping failed: 0x%08X\n", status);
+            return NT_SUCCESS(status) ? STATUS_INSUFFICIENT_RESOURCES : status;
+        }
+    }
+
+    g_SharedBuffer = base;
+    g_Header = (SHARED_HEADER*)g_SharedBuffer;
+    RtlZeroMemory(g_Header, sizeof(SHARED_HEADER));
+
+    g_Header->Magic   = PROTO_MAGIC;
+    g_Header->Version = (PROTO_VER_MAJOR << 16) | PROTO_VER_MINOR;
     InterlockedExchange(&g_Header->Status, IPC_READY);
     KeInitializeEvent(&g_InjMutex, SynchronizationEvent, TRUE);
 
-    DRV_LOG(
-        "[drv] Shared buffer at %p (%llu bytes), MDL built — no named object\n",
-        g_SharedBuffer, (ULONGLONG)SHM_TOTAL_SIZE);
-
+    DRV_LOG("[drv] Shared view %p (%llu bytes) %s\n",
+            g_SharedBuffer, (ULONGLONG)SHM_TOTAL_SIZE,
+            g_ViewInSystemSpace ? "[system]" : "[system-process]");
     return STATUS_SUCCESS;
 }
 
 VOID DestroySharedMemory(VOID)
 {
-    if (g_UserMappedVa && g_InjectorProc) {
-        KAPC_STATE apc;
-        KeStackAttachProcess(g_InjectorProc, &apc);
-        __try { MmUnmapLockedPages(g_UserMappedVa, g_SharedMdl); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-        KeUnstackDetachProcess(&apc);
-        g_UserMappedVa = NULL;
-    }
-    if (g_SharedMdl) {
-        IoFreeMdl(g_SharedMdl);
-        g_SharedMdl = NULL;
-    }
     if (g_SharedBuffer) {
-        ExFreePoolWithTag(g_SharedBuffer, DRV_POOL_TAG);
+        if (g_ViewInSystemSpace)
+            MmUnmapViewInSystemSpace(g_SharedBuffer);
+        else
+            ZwUnmapViewOfSection(
+                g_SystemProcHandle ? g_SystemProcHandle : NtCurrentProcess(),
+                g_SharedBuffer);
         g_SharedBuffer = NULL;
     }
-    if (g_InjectorProc) {
-        ObDereferenceObject(g_InjectorProc);
-        g_InjectorProc = NULL;
+    if (g_SystemProcHandle) {
+        ZwClose(g_SystemProcHandle);
+        g_SystemProcHandle = NULL;
+    }
+    if (g_ShmSection) {
+        ZwClose(g_ShmSection);
+        g_ShmSection = NULL;
     }
     g_Header = NULL;
-}
-
-static VOID ProcessNotifyCallback(
-    _In_     PEPROCESS            Process,
-    _In_     HANDLE               ProcessId,
-    _In_opt_ PPS_CREATE_NOTIFY_INFO CreateInfo)
-{
-    UNREFERENCED_PARAMETER(ProcessId);
-
-    __try {
-        if (!CreateInfo) {
-            if (Process == g_InjectorProc) {
-                g_UserMappedVa = NULL;
-                ObDereferenceObject(g_InjectorProc);
-                g_InjectorProc = NULL;
-            }
-            return;
-        }
-
-        if (!CreateInfo->ImageFileName || !g_SharedMdl) return;
-
-        PCUNICODE_STRING full = CreateInfo->ImageFileName;
-        if (!full->Buffer || full->Length == 0) return;
-
-        USHORT slash = 0;
-        for (USHORT i = 0; i < full->Length / sizeof(WCHAR); i++)
-            if (full->Buffer[i] == L'\\') slash = (USHORT)(i + 1);
-
-        UNICODE_STRING baseName = {
-            (USHORT)(full->Length - slash * sizeof(WCHAR)),
-            (USHORT)(full->Length - slash * sizeof(WCHAR)),
-            full->Buffer + slash
-        };
-        UNICODE_STRING injName;
-        RtlInitUnicodeString(&injName, INJECTOR_PROCESS_NAME);
-
-        if (RtlCompareUnicodeString(&baseName, &injName, TRUE) != 0) return;
-        if (g_InjectorProc) return;
-
-        PVOID mapped = NULL;
-        KAPC_STATE apc;
-        KeStackAttachProcess(Process, &apc);
-        __try {
-            mapped = MmMapLockedPagesSpecifyCache(
-                g_SharedMdl, UserMode, MmCached, NULL, FALSE,
-                (MM_PAGE_PRIORITY)(NormalPagePriority | MdlMappingNoExecute)
-            );
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) { mapped = NULL; }
-        KeUnstackDetachProcess(&apc);
-
-        if (!mapped) return;
-
-        ObReferenceObject(Process);
-        g_InjectorProc = Process;
-        g_UserMappedVa = mapped;
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    g_ViewInSystemSpace = FALSE;
 }
 
 static VOID UpdateProgress(_In_ LONG Pct, _In_ const char* Msg)
 {
-    if (!g_Header) return;
+    if (!SharedHeaderValid()) return;
     InterlockedExchange(&g_Header->Progress, Pct);
 
     SIZE_T len = 0;
@@ -328,6 +407,12 @@ NTSTATUS ValidatePeImage(_In_ PVOID RawDll, _In_ ULONG DllSize)
 
     if (nt->OptionalHeader.SizeOfImage == 0 || nt->OptionalHeader.SizeOfImage > 0x10000000) {
         DRV_ERR("[drv] SizeOfImage out of range: 0x%X\n", nt->OptionalHeader.SizeOfImage);
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
+    if (nt->OptionalHeader.SizeOfHeaders == 0 ||
+        nt->OptionalHeader.SizeOfHeaders > 0x10000) {
+        DRV_ERR("[drv] SizeOfHeaders out of range: 0x%X\n", nt->OptionalHeader.SizeOfHeaders);
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -422,9 +507,11 @@ NTSTATUS ProcessRelocations(
     PIMAGE_BASE_RELOCATION block = (PIMAGE_BASE_RELOCATION)relocBuf;
     ULONG processed = 0;
 
+    __try {
     while (processed < relocSize && block->SizeOfBlock >= sizeof(IMAGE_BASE_RELOCATION)) {
         if (block->SizeOfBlock > relocSize - processed) break;
         ULONG count = (block->SizeOfBlock - sizeof(IMAGE_BASE_RELOCATION)) / sizeof(USHORT);
+        if (count > 0x10000) break;
         PUSHORT entries = (PUSHORT)((ULONG_PTR)block + sizeof(IMAGE_BASE_RELOCATION));
 
         for (ULONG i = 0; i < count; i++) {
@@ -464,6 +551,10 @@ NTSTATUS ProcessRelocations(
         processed += block->SizeOfBlock;
         block = (PIMAGE_BASE_RELOCATION)((ULONG_PTR)block + block->SizeOfBlock);
     }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        DRV_ERR("[drv] Malformed relocation table\n");
+        status = STATUS_INVALID_IMAGE_FORMAT;
+    }
 
     ExFreePoolWithTag(relocBuf, DRV_POOL_TAG);
 
@@ -473,12 +564,28 @@ NTSTATUS ProcessRelocations(
     return STATUS_SUCCESS;
 }
 
-static PVOID FindModuleBase(_In_ PEPROCESS Process, _In_ PCWSTR ModName)
+// ApiSet contract names (api-ms-win-* / ext-ms-win-*) are not present in the
+// PEB loader list by their contract name; the loader redirects them to a real
+// implementation DLL. Resolve imports of this DLL's CRT dependencies.
+static PCWSTR ApiSetImplementation(PCWSTR Name)
+{
+    if (!Name) return NULL;
+    if (_wcsnicmp(Name, L"api-ms-win-crt-", 15) == 0)
+        return L"ucrtbase.dll";
+    if (_wcsnicmp(Name, L"api-ms-win-core-", 16) == 0)
+        return L"kernel32.dll";
+    if (_wcsnicmp(Name, L"api-ms-win-security-", 20) == 0)
+        return L"kernelbase.dll";
+    if (_wcsnicmp(Name, L"ext-ms-win-", 11) == 0)
+        return L"kernel32.dll";
+    return NULL;
+}
+
+// Caller must already be attached to Process (or be in system context with
+// the target PEB readable). Does not attach/detach itself.
+static PVOID FindModuleBaseAttached(_In_ PEPROCESS Process, _In_ PCWSTR ModName)
 {
     PVOID result = NULL;
-    KAPC_STATE apcState;
-
-    KeStackAttachProcess(Process, &apcState);
 
     __try {
 
@@ -491,15 +598,17 @@ static PVOID FindModuleBase(_In_ PEPROCESS Process, _In_ PCWSTR ModName)
         PLIST_ENTRY head = &ldr->InLoadOrderModuleList;
         PLIST_ENTRY entry = head->Flink;
 
+        UNICODE_STRING target, aliasTarget;
+        RtlInitUnicodeString(&target, ModName);
+        PCWSTR alias = ApiSetImplementation(ModName);
+        if (alias) RtlInitUnicodeString(&aliasTarget, alias);
+
         while (entry != head) {
             PLDR_DATA_TABLE_ENTRY mod = CONTAINING_RECORD(entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks);
 
             if (mod->BaseDllName.Buffer) {
-
-                UNICODE_STRING target;
-                RtlInitUnicodeString(&target, ModName);
-
-                if (RtlCompareUnicodeString(&mod->BaseDllName, &target, TRUE) == 0) {
+                if (RtlCompareUnicodeString(&mod->BaseDllName, &target, TRUE) == 0 ||
+                    (alias && RtlCompareUnicodeString(&mod->BaseDllName, &aliasTarget, TRUE) == 0)) {
                     result = mod->DllBase;
                     __leave;
                 }
@@ -512,6 +621,16 @@ static PVOID FindModuleBase(_In_ PEPROCESS Process, _In_ PCWSTR ModName)
         result = NULL;
     }
 
+    return result;
+}
+
+static PVOID FindModuleBase(_In_ PEPROCESS Process, _In_ PCWSTR ModName)
+{
+    PVOID result = NULL;
+    KAPC_STATE apcState;
+
+    KeStackAttachProcess(Process, &apcState);
+    result = FindModuleBaseAttached(Process, ModName);
     KeUnstackDetachProcess(&apcState);
     return result;
 }
@@ -538,7 +657,7 @@ PVOID FindExportSafe(_In_ PVOID ModBase, _In_ PCCH FuncName)
         PUSHORT ordinals = (PUSHORT)((ULONG_PTR)ModBase + exp->AddressOfNameOrdinals);
         PULONG  funcRvas = (PULONG) ((ULONG_PTR)ModBase + exp->AddressOfFunctions);
 
-        for (ULONG i = 0; i < exp->NumberOfNames; i++) {
+        for (ULONG i = 0; i < exp->NumberOfNames && i < 0x10000; i++) {
             char* name = (char*)((ULONG_PTR)ModBase + nameRvas[i]);
             const char* a = name, *b = FuncName;
             BOOLEAN match = TRUE;
@@ -574,7 +693,7 @@ PVOID FindExportByOrdinal(_In_ PVOID ModBase, _In_ USHORT Ordinal)
 
         PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((ULONG_PTR)ModBase + exportRva);
         ULONG idx = (ULONG)(Ordinal - (USHORT)exp->Base);
-        if (idx >= exp->NumberOfFunctions) __leave;
+        if (idx >= exp->NumberOfFunctions || idx >= 0x10000) __leave;
 
         PULONG funcRvas = (PULONG)((ULONG_PTR)ModBase + exp->AddressOfFunctions);
         ULONG fRva = funcRvas[idx];
@@ -608,12 +727,188 @@ PVOID ResolveForwardedExport(_In_ PEPROCESS Process, _In_ const char* ForwardStr
     if (!modBase) return NULL;
 
     const char* funcName = dot + 1;
-    if (funcName[0] == '#') {
-        ULONG ord = 0;
-        RtlCharToInteger(funcName + 1, 10, &ord);
-        return FindExportByOrdinal(modBase, (USHORT)ord);
+    PVOID result = NULL;
+    KAPC_STATE apc;
+    KeStackAttachProcess(Process, &apc);
+    __try {
+        if (funcName[0] == '#') {
+            ULONG ord = 0;
+            RtlCharToInteger(funcName + 1, 10, &ord);
+            result = FindExportByOrdinal(modBase, (USHORT)ord);
+        } else {
+            result = FindExportSafe(modBase, funcName);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        result = NULL;
     }
-    return FindExportSafe(modBase, funcName);
+    KeUnstackDetachProcess(&apc);
+    return result;
+}
+
+// ---- Forwarder-aware export resolution -------------------------------------
+// The target DLL's IAT is patched with these. FindExportSafe()/ByOrdinal()
+// deliberately skip forwarders (an RVA inside the export directory), which
+// leaves the hint/name RVA in the IAT. That value is then called as a function
+// pointer and the process faults (e.g. KERNEL32!InitializeSListHead, which is
+// a forwarder to NTDLL.RtlInitializeSListHead). Follow forwarders recursively.
+#define MAX_FORWARD_DEPTH 8
+
+static PVOID ResolveExportByNameAttached(_In_ PEPROCESS Process, _In_ PVOID ModBase,
+                                         _In_ PCCH FuncName, _In_ ULONG Depth);
+static PVOID ResolveExportByOrdinalAttached(_In_ PEPROCESS Process, _In_ PVOID ModBase,
+                                            _In_ USHORT Ordinal, _In_ ULONG Depth);
+
+static BOOLEAN GetExportRvaByNameAttached(
+    _In_ PVOID ModBase, _In_ PCCH FuncName,
+    _Out_ PULONG OutFRva, _Out_ PULONG OutExpRva, _Out_ PULONG OutExpSize)
+{
+    BOOLEAN ok = FALSE;
+    __try {
+        IMAGE_DOS_HEADER dos;
+        IMAGE_NT_HEADERS64 nt;
+        RtlCopyMemory(&dos, ModBase, sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        RtlCopyMemory(&nt, (PVOID)((ULONG_PTR)ModBase + dos.e_lfanew), sizeof(nt));
+        if (nt.Signature != IMAGE_NT_SIGNATURE) __leave;
+
+        ULONG exportRva  = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exportSize = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exportRva) __leave;
+
+        PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((ULONG_PTR)ModBase + exportRva);
+        PULONG  nameRvas = (PULONG) ((ULONG_PTR)ModBase + exp->AddressOfNames);
+        PUSHORT ordinals = (PUSHORT)((ULONG_PTR)ModBase + exp->AddressOfNameOrdinals);
+        PULONG  funcRvas = (PULONG) ((ULONG_PTR)ModBase + exp->AddressOfFunctions);
+
+        for (ULONG i = 0; i < exp->NumberOfNames && i < 0x10000; i++) {
+            char* name = (char*)((ULONG_PTR)ModBase + nameRvas[i]);
+            const char* a = name, *b = FuncName;
+            BOOLEAN match = TRUE;
+            while (*a && *b) { if (*a++ != *b++) { match = FALSE; break; } }
+            if (!match || *a != *b) continue;
+
+            *OutFRva    = funcRvas[ordinals[i]];
+            *OutExpRva  = exportRva;
+            *OutExpSize = exportSize;
+            ok = TRUE;
+            break;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = FALSE; }
+    return ok;
+}
+
+static BOOLEAN GetExportRvaByOrdinalAttached(
+    _In_ PVOID ModBase, _In_ USHORT Ordinal,
+    _Out_ PULONG OutFRva, _Out_ PULONG OutExpRva, _Out_ PULONG OutExpSize)
+{
+    BOOLEAN ok = FALSE;
+    __try {
+        IMAGE_DOS_HEADER dos;
+        IMAGE_NT_HEADERS64 nt;
+        RtlCopyMemory(&dos, ModBase, sizeof(dos));
+        if (dos.e_magic != IMAGE_DOS_SIGNATURE) __leave;
+        RtlCopyMemory(&nt, (PVOID)((ULONG_PTR)ModBase + dos.e_lfanew), sizeof(nt));
+        if (nt.Signature != IMAGE_NT_SIGNATURE) __leave;
+
+        ULONG exportRva  = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        ULONG exportSize = nt.OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
+        if (!exportRva) __leave;
+
+        PIMAGE_EXPORT_DIRECTORY exp = (PIMAGE_EXPORT_DIRECTORY)((ULONG_PTR)ModBase + exportRva);
+        ULONG idx = (ULONG)(Ordinal - (USHORT)exp->Base);
+        if (idx >= exp->NumberOfFunctions || idx >= 0x10000) __leave;
+
+        *OutFRva    = ((PULONG)((ULONG_PTR)ModBase + exp->AddressOfFunctions))[idx];
+        *OutExpRva  = exportRva;
+        *OutExpSize = exportSize;
+        ok = TRUE;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = FALSE; }
+    return ok;
+}
+
+static PVOID FollowForwarderAttached(
+    _In_ PEPROCESS Process, _In_ PVOID ModBase,
+    _In_ ULONG FRva, _In_ ULONG ExpRva, _In_ ULONG ExpSize, _In_ ULONG Depth)
+{
+    if (Depth >= MAX_FORWARD_DEPTH || !ModBase) return NULL;
+    UNREFERENCED_PARAMETER(ExpRva);
+    UNREFERENCED_PARAMETER(ExpSize);
+
+    PVOID result = NULL;
+    __try {
+        // Forwarder strings are ASCII "Module.Function" or "Module.#Ordinal".
+        char fwd[256] = { 0 };
+        const char* src = (const char*)((ULONG_PTR)ModBase + FRva);
+        SIZE_T i = 0;
+        for (; i < sizeof(fwd) - 1; i++) {
+            char c = src[i];
+            if (!c) break;
+            fwd[i] = c;
+        }
+        fwd[i] = 0;
+
+        const char* dot = NULL;
+        for (const char* q = fwd; *q; q++) { if (*q == '.') { dot = q; break; } }
+        if (!dot || dot == fwd || !dot[1]) __leave;
+
+        SIZE_T modLen = (SIZE_T)(dot - fwd);
+        if (modLen >= 120) __leave;
+
+        WCHAR wMod[128] = { 0 };
+        for (SIZE_T j = 0; j < modLen; j++) wMod[j] = (WCHAR)fwd[j];
+        for (SIZE_T j = 0; j < 4; j++) wMod[modLen + j] = L".dll"[j];
+
+        PVOID targetBase = FindModuleBaseAttached(Process, wMod);
+        if (!targetBase) __leave;
+
+        if (dot[1] == '#') {
+            ULONG ord = 0;
+            RtlCharToInteger(dot + 2, 10, &ord);
+            if (ord && ord <= 0xFFFF)
+                result = ResolveExportByOrdinalAttached(Process, targetBase, (USHORT)ord, Depth + 1);
+        } else {
+            result = ResolveExportByNameAttached(Process, targetBase, dot + 1, Depth + 1);
+        }
+
+        // api-ms-win-core-* contracts redirection in this build maps to
+        // kernel32, but the Rtl* forwards actually live in ntdll. Fall back.
+        if (!result && _wcsnicmp(wMod, L"api-ms-win-core-", 16) == 0) {
+            PVOID ntdllBase = FindModuleBaseAttached(Process, L"ntdll.dll");
+            if (ntdllBase) {
+                if (dot[1] == '#') {
+                    ULONG ord = 0;
+                    RtlCharToInteger(dot + 2, 10, &ord);
+                    if (ord && ord <= 0xFFFF)
+                        result = ResolveExportByOrdinalAttached(Process, ntdllBase, (USHORT)ord, Depth + 1);
+                } else {
+                    result = ResolveExportByNameAttached(Process, ntdllBase, dot + 1, Depth + 1);
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { result = NULL; }
+    return result;
+}
+
+static PVOID ResolveExportByNameAttached(
+    _In_ PEPROCESS Process, _In_ PVOID ModBase, _In_ PCCH FuncName, _In_ ULONG Depth)
+{
+    ULONG fRva = 0, expRva = 0, expSize = 0;
+    if (!GetExportRvaByNameAttached(ModBase, FuncName, &fRva, &expRva, &expSize)) return NULL;
+    if (!fRva) return NULL;
+    if (fRva >= expRva && fRva < expRva + expSize)
+        return FollowForwarderAttached(Process, ModBase, fRva, expRva, expSize, Depth);
+    return (PVOID)((ULONG_PTR)ModBase + fRva);
+}
+
+static PVOID ResolveExportByOrdinalAttached(
+    _In_ PEPROCESS Process, _In_ PVOID ModBase, _In_ USHORT Ordinal, _In_ ULONG Depth)
+{
+    ULONG fRva = 0, expRva = 0, expSize = 0;
+    if (!GetExportRvaByOrdinalAttached(ModBase, Ordinal, &fRva, &expRva, &expSize)) return NULL;
+    if (!fRva) return NULL;
+    if (fRva >= expRva && fRva < expRva + expSize)
+        return FollowForwarderAttached(Process, ModBase, fRva, expRva, expSize, Depth);
+    return (PVOID)((ULONG_PTR)ModBase + fRva);
 }
 
 NTSTATUS ResolveImports(
@@ -671,16 +966,18 @@ NTSTATUS ResolveImports(
             PIMAGE_THUNK_DATA64 orig  = (PIMAGE_THUNK_DATA64)((ULONG_PTR)AllocBase + thunkRva);
             PIMAGE_THUNK_DATA64 first = (PIMAGE_THUNK_DATA64)((ULONG_PTR)AllocBase + desc->FirstThunk);
 
-            while (orig->u1.AddressOfData) {
+            for (ULONG thunkCount = 0;
+                 thunkCount < 4096 && orig->u1.AddressOfData;
+                 ++thunkCount) {
                 PVOID funcAddr = NULL;
 
                 if (IMAGE_SNAP_BY_ORDINAL64(orig->u1.Ordinal)) {
                     USHORT ordinal = IMAGE_ORDINAL64(orig->u1.Ordinal);
-                    funcAddr = FindExportByOrdinal(modBase, ordinal);
+                    funcAddr = ResolveExportByOrdinalAttached(Process, modBase, ordinal, 0);
                 } else {
                     PIMAGE_IMPORT_BY_NAME hint =
                         (PIMAGE_IMPORT_BY_NAME)((ULONG_PTR)AllocBase + orig->u1.AddressOfData);
-                    funcAddr = FindExportSafe(modBase, (PCCH)hint->Name);
+                    funcAddr = ResolveExportByNameAttached(Process, modBase, (PCCH)hint->Name, 0);
                 }
 
                 if (funcAddr)
@@ -760,7 +1057,10 @@ static const UCHAR g_ShellcodeTemplate[] = {
 };
 
 #define SHELLCODE_HMODULE_OFFSET  6
-#define SHELLCODE_ENTRY_OFFSET    25
+// mov rax,imm64 opcode (48 B8) sits at indices 24-25, so the 8-byte immediate
+// starts at 26. Writing at 25 clobbers the B8 opcode and shifts the target by
+// one byte, sending DllMain through a garbage address (~allocBase+0x13).
+#define SHELLCODE_ENTRY_OFFSET    26
 #define SHELLCODE_SIZE            sizeof(g_ShellcodeTemplate)
 
 #pragma pack(push, 8)
@@ -816,11 +1116,12 @@ static NTSTATUS FindSuitableThread(_In_ ULONG TargetPid, _Out_ PHANDLE OutHandle
     HANDLE target    = (HANDLE)(ULONG_PTR)TargetPid;
     HANDLE hFallback = NULL;
     SYS_PROC_INFO* entry = (SYS_PROC_INFO*)buf;
+    ULONG_PTR bufEnd = (ULONG_PTR)buf + bufSize;
 
     for (;;) {
         if (entry->UniqueProcessId == target && entry->NumberOfThreads > 1) {
 
-            for (ULONG i = 1; i < entry->NumberOfThreads; i++) {
+            for (ULONG i = 1; i < entry->NumberOfThreads && i < 64; i++) {
                 SYS_THREAD_INFO* ti = &entry->Threads[i];
 
                 OBJECT_ATTRIBUTES oa;
@@ -849,7 +1150,10 @@ static NTSTATUS FindSuitableThread(_In_ ULONG TargetPid, _Out_ PHANDLE OutHandle
             }
             break;
         }
-        if (!entry->NextEntryOffset) break;
+        if (!entry->NextEntryOffset ||
+            entry->NextEntryOffset > bufSize ||
+            (ULONG_PTR)entry + entry->NextEntryOffset >= bufEnd)
+            break;
         entry = (SYS_PROC_INFO*)((UCHAR*)entry + entry->NextEntryOffset);
     }
 
@@ -870,86 +1174,54 @@ static NTSTATUS RunShellcodeInTarget(
     _In_ PVOID     Sc,
     _In_ SIZE_T    ScSize)
 {
-    if (ScSize > 0xF00) return STATUS_INVALID_PARAMETER;
+    UNREFERENCED_PARAMETER(TargetPid);   // no longer hijacking a thread by pid
+    if (ScSize == 0 || ScSize > 0xF00) return STATUS_INVALID_PARAMETER;
+    if (!pfnRtlCreateUserThread) return STATUS_PROCEDURE_NOT_FOUND;
 
-    SIZE_T totalSize = 0x2000;
+    // Always execute helper shellcode on a NEW thread in the target. The old
+    // implementation redirected a live target thread to a trampoline running
+    // on a replacement stack, jumped back to the original RIP without ever
+    // restoring RSP, and then freed that stack. The resumed thread ran with a
+    // dangling stack -> arbitrary calls (e.g. NtCreateProcessEx) and MM pool /
+    // VAD corruption (0x0A IRQL_NOT_LESS_OR_EQUAL in MiCloneVads).
+    SIZE_T totalSize = 0x1000;
     PVOID  allocBase = NULL;
-    NTSTATUS status = ZwAllocateVirtualMemory(ProcHandle, &allocBase, 0, &totalSize,
+    NTSTATUS status = ZwAllocateVirtualMemory(
+        ProcHandle, &allocBase, 0, &totalSize,
         MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!NT_SUCCESS(status)) return status;
 
-    ULONG_PTR scVA        = (ULONG_PTR)allocBase;
-    ULONG_PTR trampolineVA = scVA + 0x1000;
-    ULONG_PTR stackVA      = scVA + 0x1100;
-    ULONG_PTR flagVA       = scVA + 0x1FF0;
-
-    WriteToProcess(Process, (PVOID)scVA, Sc, ScSize);
-
-    BOOLEAN executed = FALSE;
-    HANDLE  hThread  = NULL;
-
-    if (NT_SUCCESS(FindSuitableThread(TargetPid, &hThread))) {
-        if (pfnZwSuspendThread) pfnZwSuspendThread(hThread, NULL);
-        CONTEXT ctx = {};
-        ctx.ContextFlags = CONTEXT_FULL;
-        if (pfnZwGetThreadContext && NT_SUCCESS(pfnZwGetThreadContext(hThread, &ctx))) {
-            static const UCHAR kCallTpl[] = {
-                0x48, 0x83, 0xEC, 0x28,
-                0x48, 0xB8, 0,0,0,0, 0,0,0,0,
-                0xFF, 0xD0,
-                0x48, 0xB8, 0,0,0,0, 0,0,0,0,
-                0xC7, 0x00, 0x01, 0x00, 0x00, 0x00,
-                0x48, 0x83, 0xC4, 0x28,
-                0x48, 0xB8, 0,0,0,0, 0,0,0,0,
-                0xFF, 0xE0
-            };
-            UCHAR tpl[sizeof(kCallTpl)];
-            RtlCopyMemory(tpl, kCallTpl, sizeof(tpl));
-            *(ULONG_PTR*)(tpl + 6)  = scVA;
-            *(ULONG_PTR*)(tpl + 18) = flagVA;
-            *(ULONG_PTR*)(tpl + 38) = ctx.Rip;
-            WriteToProcess(Process, (PVOID)trampolineVA, tpl, sizeof(tpl));
-
-            if (pfnZwProtectVirtualMemory) {
-                PVOID pb = allocBase; SIZE_T ps = totalSize; ULONG old = 0;
-                pfnZwProtectVirtualMemory(ProcHandle, &pb, &ps, PAGE_EXECUTE_READ, &old);
-            }
-
-            CONTEXT newCtx     = ctx;
-            newCtx.Rip         = trampolineVA;
-            newCtx.Rsp         = stackVA + 0xF8;
-
-            if (pfnZwSetThreadContext && NT_SUCCESS(pfnZwSetThreadContext(hThread, &newCtx))) {
-                if (pfnZwResumeThread) pfnZwResumeThread(hThread, NULL);
-                for (int i = 0; i < 500; i++) {
-                    ULONG done = 0;
-                    ReadFromProcess(Process, (PVOID)flagVA, &done, sizeof(done));
-                    if (done) { executed = TRUE; break; }
-                    LARGE_INTEGER d; d.QuadPart = -100000LL;
-                    KeDelayExecutionThread(KernelMode, FALSE, &d);
-                }
-            } else {
-                if (pfnZwResumeThread) pfnZwResumeThread(hThread, NULL);
-            }
-        } else {
-            if (pfnZwResumeThread) pfnZwResumeThread(hThread, NULL);
-        }
-        ZwClose(hThread);
+    status = WriteToProcess(Process, allocBase, Sc, ScSize);
+    if (!NT_SUCCESS(status)) {
+        ZwFreeVirtualMemory(ProcHandle, &allocBase, &totalSize, MEM_RELEASE);
+        return status;
     }
 
-    if (!executed && pfnRtlCreateUserThread) {
-        HANDLE thr = NULL;
-        if (NT_SUCCESS(pfnRtlCreateUserThread(ProcHandle, NULL, FALSE, 0, 0, 0,
-                                               (PVOID)scVA, NULL, &thr, NULL))) {
-            LARGE_INTEGER timeout; timeout.QuadPart = -30000000LL;
-            ZwWaitForSingleObject(thr, FALSE, &timeout);
-            ZwClose(thr);
-            executed = TRUE;
-        }
+    if (pfnZwProtectVirtualMemory) {
+        PVOID pb = allocBase; SIZE_T ps = totalSize; ULONG old = 0;
+        pfnZwProtectVirtualMemory(ProcHandle, &pb, &ps, PAGE_EXECUTE_READ, &old);
     }
 
-    ZwFreeVirtualMemory(ProcHandle, &allocBase, &totalSize, MEM_RELEASE);
-    return executed ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    HANDLE thr = NULL;
+    status = pfnRtlCreateUserThread(
+        ProcHandle, NULL, FALSE, 0, 0, 0,
+        allocBase, NULL, &thr, NULL);
+    if (!NT_SUCCESS(status) || !thr) {
+        ZwFreeVirtualMemory(ProcHandle, &allocBase, &totalSize, MEM_RELEASE);
+        return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
+    }
+
+    LARGE_INTEGER timeout;
+    timeout.QuadPart = -50000000LL;   // 5 seconds
+    NTSTATUS waitSt = ZwWaitForSingleObject(thr, FALSE, &timeout);
+    ZwClose(thr);
+
+    // Only release the page once the thread is confirmed finished. If it did
+    // not signal, leaking 4 KB is far safer than freeing code mid-execution.
+    if (NT_SUCCESS(waitSt))
+        ZwFreeVirtualMemory(ProcHandle, &allocBase, &totalSize, MEM_RELEASE);
+
+    return STATUS_SUCCESS;
 }
 
 static const UCHAR kHijackTemplate[] = {
@@ -966,7 +1238,9 @@ static const UCHAR kHijackTemplate[] = {
     0x48, 0xB8, 0,0,0,0, 0,0,0,0,
     0xFF, 0xE0
 };
-enum { HJ_HMOD=6, HJ_ENTRY=24, HJ_FLAG=36, HJ_ORSP=56, HJ_ORIP=66 };
+// Offsets are the immediates of each mov rXX,imm64. '48 BC' at index 55 -> the
+// RSP immediate starts at 57; '48 B8' at index 65 -> RIP immediate starts at 67.
+enum { HJ_HMOD=6, HJ_ENTRY=24, HJ_FLAG=36, HJ_ORSP=57, HJ_ORIP=67 };
 
 static NTSTATUS ExecuteViaHijack(
     _In_ PEPROCESS Process,
@@ -1082,20 +1356,9 @@ NTSTATUS CallEntryPoint(
         return status;
     }
 
-    ULONG flags = g_Header ? g_Header->Flags : 0;
-
-    if (flags & INJ_FLAG_THREAD_HIJACK) {
-        DRV_LOG( "[drv] Using thread hijack execution\n");
-        status = ExecuteViaHijack(Process, pid, AllocBase, entryPoint, procHandle);
-
-        if (NT_SUCCESS(status)) {
-            ZwClose(procHandle);
-            return STATUS_SUCCESS;
-        }
-
-        DbgPrintEx(DPFLTR_DEFAULT_ID, DPFLTR_WARNING_LEVEL,
-            "[drv] Hijack failed (0x%08X), falling back to RtlCreateUserThread\n", status);
-    }
+    // Thread hijacking is deliberately disabled: redirecting a live target
+    // thread risks corrupting it. DllMain always runs on a fresh thread below.
+    UNREFERENCED_PARAMETER(pid);
 
     UCHAR shellcode[SHELLCODE_SIZE];
     RtlCopyMemory(shellcode, g_ShellcodeTemplate, SHELLCODE_SIZE);
@@ -1148,18 +1411,22 @@ NTSTATUS CallEntryPoint(
     );
 
     if (NT_SUCCESS(status) && threadHandle) {
-
         LARGE_INTEGER timeout;
         timeout.QuadPart = -50000000LL;
-        ZwWaitForSingleObject(threadHandle, FALSE, &timeout);
+        NTSTATUS waitSt = ZwWaitForSingleObject(threadHandle, FALSE, &timeout);
         ZwClose(threadHandle);
+
+        // Never free a page a thread may still be executing from.
+        if (NT_SUCCESS(waitSt)) {
+            ZwFreeVirtualMemory(procHandle, &scBase, &scSize, MEM_RELEASE);
+        }
     }
     else {
         DRV_ERR(
             "[drv] RtlCreateUserThread failed: 0x%08X\n", status);
+        ZwFreeVirtualMemory(procHandle, &scBase, &scSize, MEM_RELEASE);
     }
 
-    ZwFreeVirtualMemory(procHandle, &scBase, &scSize, MEM_RELEASE);
     ZwClose(procHandle);
 
     return status;
@@ -1187,12 +1454,12 @@ NTSTATUS ExecuteTlsCallbacks(
     if (!tlsDir.AddressOfCallBacks) return STATUS_SUCCESS;
 
     ULONG_PTR callbacks[64] = { 0 };
-    ReadFromProcess(
-        Process,
-        (PVOID)tlsDir.AddressOfCallBacks,
-        callbacks,
-        sizeof(callbacks)
-    );
+    if (!NT_SUCCESS(ReadFromProcess(
+            Process,
+            (PVOID)tlsDir.AddressOfCallBacks,
+            callbacks,
+            sizeof(callbacks))))
+        return STATUS_SUCCESS;
 
     ULONG pid = (ULONG)(ULONG_PTR)PsGetProcessId(Process);
 
@@ -1262,7 +1529,7 @@ NTSTATUS ResolveDelayImports(
 
     DELAY_IMPORT_DESC* desc = (DELAY_IMPORT_DESC*)buf;
 
-    while (desc->DllNameRVA) {
+    for (ULONG descCount = 0; descCount < 512 && desc->DllNameRVA; ++descCount) {
         char modNameBuf[256] = { 0 };
         ReadFromProcess(Process, (PVOID)((ULONG_PTR)AllocBase + desc->DllNameRVA), modNameBuf, 255);
 
@@ -1279,14 +1546,18 @@ NTSTATUS ResolveDelayImports(
                 PIMAGE_THUNK_DATA64 iat = (PIMAGE_THUNK_DATA64)((ULONG_PTR)AllocBase + desc->ImportAddressTableRVA);
                 PIMAGE_THUNK_DATA64 int_ = (PIMAGE_THUNK_DATA64)((ULONG_PTR)AllocBase + desc->ImportNameTableRVA);
 
-                while (int_->u1.AddressOfData) {
+                for (ULONG thunkCount = 0;
+                     thunkCount < 4096 && int_->u1.AddressOfData;
+                     ++thunkCount) {
                     PVOID fn = NULL;
                     if (IMAGE_SNAP_BY_ORDINAL64(int_->u1.Ordinal))
-                        fn = FindExportByOrdinal(modBase, IMAGE_ORDINAL64(int_->u1.Ordinal));
+                        fn = ResolveExportByOrdinalAttached(
+                            Process, modBase, IMAGE_ORDINAL64(int_->u1.Ordinal), 0);
                     else {
                         PIMAGE_IMPORT_BY_NAME hint =
                             (PIMAGE_IMPORT_BY_NAME)((ULONG_PTR)AllocBase + int_->u1.AddressOfData);
-                        fn = FindExportSafe(modBase, (PCCH)hint->Name);
+                        fn = ResolveExportByNameAttached(
+                            Process, modBase, (PCCH)hint->Name, 0);
                     }
                     if (fn) iat->u1.Function = (ULONG_PTR)fn;
                     iat++;
@@ -1414,9 +1685,6 @@ NTSTATUS PerformManualMap(
 
     SetSectionProtections(procHandle, allocBase, nt);
 
-    UpdateProgress(77, "Hiding VAD entry...");
-    HideVadNode(process, allocBase);
-
     if (!(Flags & INJ_FLAG_SKIP_EXCEPTIONS)) {
         UpdateProgress(80, "Registering exception handlers...");
 
@@ -1436,10 +1704,24 @@ NTSTATUS PerformManualMap(
                 0xC3
             };
 
-            enum { OFF_PDATA = 6, OFF_COUNT = 16, OFF_BASE = 21, OFF_FN = 31 };
+            // BA opcode at index 14 -> its imm32 starts at 15, not 16.
+            enum { OFF_PDATA = 6, OFF_COUNT = 15, OFF_BASE = 21, OFF_FN = 31 };
 
             PVOID ntdllBase = FindModuleBase(process, L"ntdll.dll");
-            PVOID fnRaft    = ntdllBase ? FindExportSafe(ntdllBase, "RtlAddFunctionTable") : NULL;
+            PVOID fnRaft    = NULL;
+            if (ntdllBase) {
+                // FindModuleBase detached before returning; ntdllBase is a
+                // user-mode VA. Reading it from the System worker context
+                // faults (KMODE_EXCEPTION_NOT_HANDLED 0x1E / 0xC0000005).
+                KAPC_STATE raftApc;
+                KeStackAttachProcess(process, &raftApc);
+                __try {
+                    fnRaft = FindExportSafe(ntdllBase, "RtlAddFunctionTable");
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    fnRaft = NULL;
+                }
+                KeUnstackDetachProcess(&raftApc);
+            }
 
             if (fnRaft) {
                 ULONG_PTR pdataVa   = (ULONG_PTR)allocBase + pdataRva;
@@ -1549,7 +1831,7 @@ static VOID WorkerRoutine(_In_ PVOID Context)
     UNREFERENCED_PARAMETER(Context);
 
     while (!g_Shutdown) {
-        if (!g_Header) break;
+        if (!SharedHeaderValid()) break;
 
         __try {
             LONG cmd = InterlockedExchange(&g_Header->Command, IPC_CMD_NONE);
@@ -1598,8 +1880,15 @@ static VOID WorkerRoutine(_In_ PVOID Context)
                     else if (result == STATUS_DLL_NOT_FOUND         ||
                              result == STATUS_ENTRYPOINT_NOT_FOUND)  errCode = IPC_ERR_IMPORTS;
                     else                                               errCode = IPC_ERR_UNKNOWN;
-                    g_Header->Message[0] = '0' + (char)((-result >> 28) & 0xF);
-                    g_Header->Message[1] = 'x';
+                    {
+                        static const char kHex[] = "0123456789ABCDEF";
+                        ULONG v = (ULONG)result;
+                        for (int i = 0; i < 8; ++i) {
+                            g_Header->Message[i] = kHex[(v >> 28) & 0xF];
+                            v <<= 4;
+                        }
+                        g_Header->Message[8] = '\0';
+                    }
                     InterlockedExchange(&g_Header->Status, errCode);
                 }
 
@@ -1625,7 +1914,7 @@ static VOID WorkerRoutine(_In_ PVOID Context)
                 break;
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
-            if (g_Header) {
+            if (SharedHeaderValid()) {
                 InterlockedExchange(&g_Header->Status, IPC_READY);
                 InterlockedExchange(&g_Header->Command, IPC_CMD_NONE);
             }
@@ -1648,8 +1937,6 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
     DRV_LOG(
         "[drv] Unloading...\n");
 
-    PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallback, TRUE);
-
     g_Shutdown = TRUE;
 
     if (g_WorkerThread) {
@@ -1658,10 +1945,33 @@ VOID DriverUnload(_In_ PDRIVER_OBJECT DriverObject)
         g_WorkerThread = NULL;
     }
 
-    DestroySharedMemory();
+    if (g_ShmSection || g_SharedBuffer)
+        DestroySharedMemory();
 
     DRV_LOG(
         "[drv] Unloaded successfully\n");
+}
+
+// The mapper invokes DriverEntry through a 12-byte overlay on nt!NtAddAtom and
+// leaves that kernel-code hook in place until DriverEntry returns. PatchGuard
+// samples that window; the longer DriverEntry runs, the more likely a 0x109
+// CRITICAL_STRUCTURE_CORRUPTION. Keep DriverEntry to a handful of instructions
+// and do all real setup on a deferred system thread, after the hook is gone.
+static VOID InitAndWorkRoutine(_In_ PVOID Context)
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    if (!NT_SUCCESS(ResolveDynamicImports())) {
+        DRV_ERR("[drv] deferred import resolution failed\n");
+        PsTerminateSystemThread(STATUS_PROCEDURE_NOT_FOUND);
+    }
+
+    if (!NT_SUCCESS(CreateSharedMemory())) {
+        DRV_ERR("[drv] deferred shared-memory setup failed\n");
+        PsTerminateSystemThread(STATUS_UNSUCCESSFUL);
+    }
+
+    WorkerRoutine(NULL);   // never returns
 }
 
 extern "C" NTSTATUS DriverEntry(
@@ -1670,57 +1980,35 @@ extern "C" NTSTATUS DriverEntry(
 {
     UNREFERENCED_PARAMETER(RegistryPath);
 
-    DRV_LOG(
-        "[drv] DriverEntry — initializing\n");
+    // Real in the import table (keeps the mapper from freeing the image) but
+    // gated behind a value that is always FALSE, so it is never executed.
+    KeepResidentMarker();
 
     DriverObject->DriverUnload = DriverUnload;
-
-    NTSTATUS status = ResolveDynamicImports();
-    if (!NT_SUCCESS(status)) {
-        DRV_ERR(
-            "[drv] Failed to resolve dynamic imports: 0x%08X\n", status);
-        return status;
-    }
-
-    status = CreateSharedMemory();
-    if (!NT_SUCCESS(status)) {
-        DRV_ERR(
-            "[drv] Failed to create shared buffer: 0x%08X\n", status);
-        return status;
-    }
-
-    status = PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallback, FALSE);
-    if (!NT_SUCCESS(status)) {
-        DRV_ERR(
-            "[drv] PsSetCreateProcessNotifyRoutineEx failed: 0x%08X\n", status);
-        DestroySharedMemory();
-        return status;
-    }
 
     HANDLE threadHandle = NULL;
     OBJECT_ATTRIBUTES objAttr;
     InitializeObjectAttributes(&objAttr, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
 
-    status = PsCreateSystemThread(
+    NTSTATUS status = PsCreateSystemThread(
         &threadHandle,
         THREAD_ALL_ACCESS,
         &objAttr,
         NULL,
         NULL,
-        WorkerRoutine,
+        InitAndWorkRoutine,
         NULL
     );
 
     if (!NT_SUCCESS(status)) {
-        DRV_ERR(
-            "[drv] Failed to create worker thread: 0x%08X\n", status);
-        PsSetCreateProcessNotifyRoutineEx(ProcessNotifyCallback, TRUE);
-        DestroySharedMemory();
+        DRV_ERR("[drv] failed to spawn init worker: 0x%08X\n", status);
         return status;
     }
 
     g_WorkerThread = threadHandle;
 
+    // No section creation, no view mapping, no import walk here: return now so
+    // the mapper restores nt!NtAddAtom almost immediately.
     return STATUS_SUCCESS;
 }
 

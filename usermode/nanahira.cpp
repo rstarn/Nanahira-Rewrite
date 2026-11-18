@@ -8,6 +8,25 @@
 
 #define DISCORD_APP_ID "1472658353913204737"
 
+// Override with NANAHIRA_MAPPER when the mapper is staged elsewhere.
+static const char* MapperHint()
+{
+    static char buf[MAX_PATH];
+    static bool resolved = false;
+    if (!resolved) {
+        char* value = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&value, &len, "NANAHIRA_MAPPER") == 0 && value && *value) {
+            strncpy_s(buf, value, sizeof(buf) - 1);
+            free(value);
+        } else {
+            strcpy_s(buf, "D:\\Ameger\\Mapper\\Build\\Release\\Mapper.exe");
+        }
+        resolved = true;
+    }
+    return buf;
+}
+
 INJECT_MODE g_InjectMode = MODE_KERNEL;
 
 typedef struct { int r, g, b; } RGB;
@@ -87,49 +106,49 @@ static void DrawProgressBar(int pct, const char* label) {
     fflush(stdout);
 }
 
-SHARED_HEADER* ConnectToDriver(void) {
+SHARED_HEADER* ConnectToDriver(void)
+{
+    // The driver exposes the shared buffer as a global named section. Retry
+    // briefly in case it is still initializing.
+    const DWORD deadline = GetTickCount() + 5000;
 
-    SYSTEM_INFO si;
-    GetSystemInfo(&si);
+    do {
+        HANDLE hMap = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, SHM_SECTION_NAME_A);
+        if (hMap) {
+            void* view = MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, SHM_TOTAL_SIZE);
+            CloseHandle(hMap);
 
-    BYTE* addr = (BYTE*)si.lpMinimumApplicationAddress;
-    const BYTE* end = (BYTE*)si.lpMaximumApplicationAddress;
-
-    while (addr < end) {
-        MEMORY_BASIC_INFORMATION mbi = {};
-        if (!VirtualQuery(addr, &mbi, sizeof(mbi))) break;
-
-        BOOL protectOk = (mbi.Protect & PAGE_READWRITE) &&
-                         !(mbi.Protect & PAGE_NOACCESS) &&
-                         !(mbi.Protect & PAGE_GUARD);
-
-        if (mbi.State == MEM_COMMIT                  &&
-            protectOk                                &&
-            mbi.RegionSize >= (SIZE_T)SHM_TOTAL_SIZE) {
-
-            __try {
-                volatile SHARED_HEADER* hdr = (volatile SHARED_HEADER*)mbi.BaseAddress;
+            if (view) {
+                volatile SHARED_HEADER* hdr = (volatile SHARED_HEADER*)view;
                 LONG st = hdr->Status;
                 BOOLEAN statusOk = (st == IPC_IDLE || st == IPC_READY ||
                                     st == IPC_BUSY  || st == IPC_DONE);
                 if (hdr->Magic   == PROTO_MAGIC &&
                     hdr->Version == ((PROTO_VER_MAJOR << 16) | PROTO_VER_MINOR) &&
                     statusOk) {
-                    return (SHARED_HEADER*)mbi.BaseAddress;
+                    return (SHARED_HEADER*)view;
                 }
+                UnmapViewOfFile(view);
             }
-            __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
-
-        addr = (BYTE*)mbi.BaseAddress + (mbi.RegionSize ? mbi.RegionSize : 4096);
-    }
+        Sleep(100);
+    } while (GetTickCount() < deadline);
 
     return NULL;
 }
 
 static void DisconnectDriver(SHARED_HEADER* hdr) {
+    if (hdr) UnmapViewOfFile(hdr);
+}
 
-    (void)hdr;
+// Clear any result from a previous injection before arming the next command.
+// Without this, a second InjectDll() can observe the stale IPC_DONE left by the
+// first one and report success without the driver having done any work.
+static void ArmCommand(SHARED_HEADER* hdr, LONG command) {
+    InterlockedExchange(&hdr->Status, IPC_BUSY);
+    InterlockedExchange(&hdr->Progress, 0);
+    MemoryBarrier();
+    InterlockedExchange(&hdr->Command, command);
 }
 
 static BOOL WaitForResult(SHARED_HEADER* hdr, int timeoutMs) {
@@ -158,6 +177,14 @@ static BOOL WaitForResult(SHARED_HEADER* hdr, int timeoutMs) {
         }
 
         Sleep(50);
+    }
+
+    // The driver may have written IPC_DONE between our last poll and the
+    // deadline. Re-read once so the deadline race isn't reported as failure.
+    if (InterlockedCompareExchange(&hdr->Status, 0, 0) == IPC_DONE) {
+        DrawProgressBar(100, "Complete");
+        printf("\n");
+        return TRUE;
     }
 
     printf("\n");
@@ -287,7 +314,9 @@ static void InteractiveMode(void) {
     SHARED_HEADER* hdr = ConnectToDriver();
     if (!hdr) {
         PrintErr("Cannot connect — is the driver loaded?");
-        PrintWarn("Load driver first: kdmapper.exe driver.sys");
+        char hint[MAX_PATH + 32];
+        snprintf(hint, sizeof(hint), "Map the driver first: %s output\\driver.sys", MapperHint());
+        PrintWarn(hint);
         free(dllData);
         return;
     }
@@ -319,7 +348,7 @@ static void InteractiveMode(void) {
     PrintStep(6, 6, "Sending injection command...");
     printf("\n");
 
-    InterlockedExchange(&hdr->Command, IPC_CMD_INJECT);
+    ArmCommand(hdr, IPC_CMD_INJECT);
 
     if (WaitForResult(hdr, POLL_TIMEOUT_MS)) {
         printf("\n");
@@ -336,6 +365,16 @@ static void InteractiveMode(void) {
     else {
         printf("\n");
         LONG errStatus = InterlockedCompareExchange(&hdr->Status, 0, 0);
+        if (errStatus == IPC_DONE) {
+            printf("  " CLR_GREEN CLR_BOLD "INJECTION SUCCESSFUL" CLR_RESET "\n");
+            char baseMsg2[256];
+            sprintf_s(baseMsg2, sizeof(baseMsg2), "Mapped base: 0x%llX", hdr->BaseAddr);
+            PrintOk(baseMsg2);
+            char targetMsg2[256];
+            sprintf_s(targetMsg2, sizeof(targetMsg2), "Target: %s (PID %u)", procName, pid);
+            PrintInfo(targetMsg2);
+            return;
+        }
         printf("  " CLR_RED CLR_BOLD "INJECTION FAILED" CLR_RESET "\n");
 
         char errMsg[256];
@@ -357,6 +396,8 @@ static void InteractiveMode(void) {
 
 int main(int argc, char* argv[])
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+
     bool consoleMode = false;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--console") == 0) consoleMode = true;
@@ -411,23 +452,13 @@ int main(int argc, char* argv[])
 
     PrintInfo("Checking driver status...");
     SHARED_HEADER* hdrCheck = ConnectToDriver();
-    if (hdrCheck && hdrCheck->Status == IPC_READY) {
+    if (hdrCheck) {
         PrintOk("Nanahira driver is loaded and ready.");
     } else {
-        printf("\n");
-        PrintWarn("Driver not found in memory.");
-        printf("\n");
-        printf("  " CLR_YELLOW "To load the driver:\n" CLR_RESET);
-        printf("  " CLR_WHITE  "  1. Run " CLR_CYAN "load_driver.bat" CLR_WHITE " as Administrator\n" CLR_RESET);
-        printf("  " CLR_WHITE  "  2. Restart your PC when prompted\n" CLR_RESET);
-        printf("  " CLR_WHITE  "  3. Launch nanahira.exe again after reboot\n" CLR_RESET);
-        printf("\n");
-        printf("  " CLR_DIM "Kernel mode requires the driver to be\n" CLR_RESET);
-        printf("  " CLR_DIM "registered as a Boot-Start service.\n" CLR_RESET);
-        printf("\n");
-        printf("  Press any key to continue or close the window...\n");
-        _getch();
-        return 1;
+        // A manually mapped driver has no service entry and no module name.
+        // Do not gate the CLI on the old Boot-Start service check; the inject
+        // path below reports a real connection failure if one exists.
+        PrintWarn("Driver channel not visible yet - continuing.");
     }
 
     printf("\n");
@@ -447,26 +478,26 @@ int main(int argc, char* argv[])
         if (g_InjectMode == MODE_HOOK) {
             PrintStep(1, 2, xor_a("Locating target process..."));
             DWORD pid = FindProcessId(procName);
-            if (!pid) { PrintErr(xor_a("Process not found")); _getch(); return 1; }
+            if (!pid) { PrintErr(xor_a("Process not found")); return 1; }
             wchar_t wDll[MAX_PATH] = {};
             MultiByteToWideChar(CP_ACP, 0, dllPath, -1, wDll, MAX_PATH);
             PrintStep(2, 2, xor_a("Injecting via WinEventHook..."));
             if (HookInjector::inject(pid, wDll)) PrintOk(xor_a("Hook injection successful"));
             else PrintErr(xor_a("Hook injection failed"));
-            printf("\n  Press any key...\n"); _getch();
+            printf("\n");
             return 0;
         }
 
         if (g_InjectMode == MODE_USERMODE) {
             PrintStep(1, 2, xor_a("Locating target process..."));
             DWORD pid = FindProcessId(procName);
-            if (!pid) { PrintErr(xor_a("Process not found")); _getch(); return 1; }
+            if (!pid) { PrintErr(xor_a("Process not found")); return 1; }
             wchar_t wDll[MAX_PATH] = {};
             MultiByteToWideChar(CP_ACP, 0, dllPath, -1, wDll, MAX_PATH);
             PrintStep(2, 2, xor_a("Injecting via usermode fallback..."));
             if (UmInjector::inject(pid, wDll)) PrintOk(xor_a("Usermode injection successful"));
             else PrintErr(xor_a("Usermode injection failed"));
-            printf("\n  Press any key...\n"); _getch();
+            printf("\n");
             return 0;
         }
 
@@ -553,7 +584,7 @@ int main(int argc, char* argv[])
         PrintStep(6, 6, "Injecting...");
         printf("\n");
 
-        InterlockedExchange(&hdr->Command, IPC_CMD_INJECT);
+        ArmCommand(hdr, IPC_CMD_INJECT);
 
         if (WaitForResult(hdr, POLL_TIMEOUT_MS)) {
             printf("\n");

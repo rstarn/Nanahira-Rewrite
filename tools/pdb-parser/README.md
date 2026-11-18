@@ -1,4 +1,8 @@
-# pdb-parser Rust Kernel Offset Generator
+> **Legacy / superseded.** This Rust tool is kept for reference only. The
+> active build uses `tools\dia-offsetgen\build_and_run.bat`, which verifies the
+> PDB GUID against the live kernel and needs no Rust toolchain or downloads.
+
+# pdb-parser Rust Kernel Offset Generator (legacy)
 
 Generates `driver/offsets.h` automatically by downloading the correct
 `ntoskrnl.pdb` from Microsoft Symbol Server and extracting struct member

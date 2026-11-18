@@ -51,10 +51,12 @@ typedef struct _PEB {
     PVOID         ProcessParameters;
 } PEB, *PPEB;
 
+// RTL_BALANCED_NODE layout, confirmed against ntkrnlmp.pdb for build 26300.
+// Left and Right come first; ParentValue trails. The old order walked garbage.
 typedef struct _MM_AVL_NODE {
-    ULONG_PTR            ParentValue;
     struct _MM_AVL_NODE* Left;
     struct _MM_AVL_NODE* Right;
+    ULONG_PTR            ParentValue;
 } MM_AVL_NODE, *PMM_AVL_NODE;
 
 typedef struct _MMVAD_SHORT {

@@ -45,3 +45,7 @@ build_test_dll.bat
 
 
 
+
+# Python caches
+__pycache__/
+*.pyc

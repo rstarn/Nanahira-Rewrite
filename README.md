@@ -19,7 +19,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/C%2B%2B-00599C?style=flat&logo=cplusplus&logoColor=white" />
   <img src="https://img.shields.io/badge/Windows%20Driver%20Kit-0078D4?style=flat&logo=windows&logoColor=white" />
-  <img src="https://img.shields.io/badge/Visual%20Studio%202022-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
+  <img src="https://img.shields.io/badge/Visual%20Studio%202026%20Build%20Tools-5C2D91?style=flat&logo=visualstudio&logoColor=white" />
   <img src="https://img.shields.io/badge/x64-Kernel%20Mode-ef4444?style=flat" />
 </p>
 
@@ -59,7 +59,7 @@ Three injection modes are available depending on your situation:
                                              Call DllMain
 ```
 
-The IPC channel between usermode and the kernel driver uses an **anonymous MDL-mapped buffer** no named section objects, no visible handles in the global namespace. The driver auto-maps the buffer into `nanahira.exe` via a process notify callback when the injector starts.
+The IPC channel uses a global named section (`Global\NanahiraSharedV3`) created by the driver and opened by `nanahira.exe`. No process-notify callback is registered: callback registration is rejected for manually mapped images by `MmVerifyCallbackFunctionCheckFlags`. The driver no longer attaches to the injector to map an MDL; the section is visible as soon as `DriverEntry` returns.
 
 ---
 
@@ -82,7 +82,7 @@ The IPC channel between usermode and the kernel driver uses an **anonymous MDL-m
 | **KEVENT injection mutex** | Prevents concurrent inject races second inject waits up to 5 s before failing |
 | **PE deep validator** | Checks `SizeOfImage` bounds and all section `PointerToRawData` offsets before mapping |
 | **Worker SEH recovery** | `__try/__except` around worker loop AV in ring-0 resets state instead of BSOD |
-| **Stealth IPC** | Anonymous MDL-mapped buffer no named kernel objects visible to scanners |
+| **Stealth IPC** | Global named section shared between the mapped driver and injector; no process-notify callback |
 | **WinEventHook injection** | Alternative entry via `SetWinEventHook` + self-contained shellcode |
 | **Usermode fallback** | Works without driver full PE shellcode runs inside target |
 | **Compile-time XOR strings** | Sensitive literals encrypted at compile time via template metaprogramming |
@@ -118,7 +118,8 @@ kernel-mmi/
 │   └── discord_rpc.h
 │
 ├── tools/
-│   ├── pdb-parser/              Rust-based Windows Kernel PDB offset parsing tool
+│   ├── pdb-parser/              Legacy Rust PDB parser (superseded by dia-offsetgen)
+│   ├── dia-offsetgen/           DIA-based offset generator + PDB GUID verifier
 │   ├── signature_randomizer.ps1 PE binary mutation script
 │   └── source_randomizer.ps1   Identifier randomization script
 │
@@ -132,12 +133,12 @@ kernel-mmi/
 
 | | Details |
 |:---|:---|
-| Windows 10 / 11 x64 | Tested on 22H2 / 23H2 |
-| Administrator | Everything needs elevation |
-| Visual Studio 2022 | Desktop development with C++ workload |
-| Windows Driver Kit | Match your Windows SDK version |
-| Rust & Cargo | Installed on build system (required for pdb-parser) |
-| PowerShell 7+ | Required for signature randomization scripts |
+| Windows 11 x64 | Built and verified on 26H2 / build 10.0.26300 |
+| Administrator | Required for the mapper and build script |
+| Visual Studio 2026 Build Tools | MSVC v145 (14.51), Desktop development with C++ |
+| Windows SDK / WDK | 10.0.28000.0, must match both `.vcxproj` files |
+| Kernel PDB | `D:\Ameger\Mapper\Build\Symbols\ntkrnlmp.pdb` (or set `PDB_PATH`) |
+| PowerShell 7+ | Required for the signature randomization scripts |
 
 ---
 
@@ -193,10 +194,9 @@ Every run produces binaries with a different SHA256 hash.
 | Error | Fix |
 |:---|:---|
 | `Access denied` | Run as Administrator |
-| `StartService FAILED 577` | Driver unsigned enable test signing + self-sign |
-| `Value protected by Secure Boot` | Disable Secure Boot in BIOS first |
-| `Memory Integrity blocking` | Windows Security → Core Isolation → Memory integrity → Off |
-| BSOD on first run | Use test signing with `bcdedit /set testsigning on` and sign driver manually |
+| Mapper rejects the image | Rebuild with `build_release.bat`, then map `output\driver.sys` |
+| `Cannot connect - is the driver loaded?` | Re-run the mapper; `nanahira.exe` uses the shared-memory channel |
+| BSOD on first run | Re-run `tools\dia-offsetgen\build_and_run.bat` — it refuses a PDB that does not match the running kernel |
 
 </details>
 
@@ -222,7 +222,7 @@ Every run produces binaries with a different SHA256 hash.
 - **Enhanced PE Validator** Validates `SizeOfImage` (max 256 MB) and all section `PointerToRawData` offsets before mapping begins, preventing BSOD from malformed DLLs.
 - **Worker Thread SEH Recovery** `__try/__except` wraps the worker switch — an access violation in ring-0 resets state to `IPC_READY` and releases the mutex instead of crashing the kernel.
 - **Unconditional Section Name Scrubbing** Section names (`.text`, `.rdata`, etc.) zeroed in target memory after mapping without requiring any flag.
-- **PDB Offset Parser** Rust-based build-time symbol parser downloads `ntoskrnl.pdb` from Microsoft symbol servers and auto-generates `offsets.h` to prevent update-induced BSODs.
+- **PDB Offset Generator** DIA-SDK generator verifies the kernel PDB GUID against the live `ntoskrnl.exe` and regenerates all 17 `offsets.h` values before every build; stale offsets cannot be compiled in.
 - **VAD Node Hiding** After injection, `StartingVpn` / `EndingVpn` are zeroed in the target process VAD tree — the allocated region becomes invisible to `NtQueryVirtualMemory`-based scanners.
 - **Full W^X Across All Modes** Hook and usermode injection modes now allocate `PAGE_READWRITE`, write shellcode, promote to `PAGE_EXECUTE_READ`, then apply correct per-section protections after execution — no RWX pages at any point.
 - **`NtCreateThreadEx` Hidden Thread** Usermode mode replaces `CreateRemoteThread` with `NtCreateThreadEx` + `THREAD_CREATE_FLAGS_HIDE_FROM_DEBUGGER`, bypassing thread-creation callbacks monitored by anti-cheat.

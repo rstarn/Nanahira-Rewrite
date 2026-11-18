@@ -189,7 +189,8 @@ struct UmInjector {
             (uintptr_t)GetProcAddress(GetModuleHandleA("ntdll.dll"),    "RtlAddFunctionTable")
         };
 
-        SIZE_T scFnSize = (SIZE_T)((BYTE*)UserModeShellcode_End - (BYTE*)UserModeShellcode);
+        SIZE_T scFnSize = (SIZE_T)((const BYTE*)reinterpret_cast<const void*>(&UserModeShellcode_End)
+                                 - (const BYTE*)reinterpret_cast<const void*>(&UserModeShellcode));
         if (sizeof(params) + scFnSize > scSize) {
             VirtualFreeEx(hProc, scBase,    0, MEM_RELEASE);
             VirtualFreeEx(hProc, flagBase,  0, MEM_RELEASE);
@@ -200,7 +201,8 @@ struct UmInjector {
         }
 
         WriteProcessMemory(hProc, scBase, &params, sizeof(params), NULL);
-        WriteProcessMemory(hProc, scBase + sizeof(params), (BYTE*)UserModeShellcode, scFnSize, NULL);
+        WriteProcessMemory(hProc, scBase + sizeof(params),
+                           reinterpret_cast<const void*>(&UserModeShellcode), scFnSize, NULL);
 
         DWORD old;
         VirtualProtectEx(hProc, scBase, scSize, PAGE_EXECUTE_READ, &old);

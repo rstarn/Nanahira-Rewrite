@@ -168,7 +168,12 @@ bool NanahiraGUI::Initialize() {
     ImFontConfig fc;
     fc.OversampleH = 2;
     static const ImWchar fontRanges[] = { 0x0020, 0x00FF, 0x2600, 0x26FF, 0 };
-    io.FontDefault = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 15.0f, &fc, fontRanges);
+    char fontPath[MAX_PATH];
+    UINT dirLen = GetWindowsDirectoryA(fontPath, MAX_PATH);
+    if (dirLen && dirLen < MAX_PATH) {
+        strcat_s(fontPath, "\\Fonts\\segoeui.ttf");
+        io.FontDefault = io.Fonts->AddFontFromFileTTF(fontPath, 15.0f, &fc, fontRanges);
+    }
     if (!io.FontDefault) io.FontDefault = io.Fonts->AddFontDefault();
 
     ImGui_ImplWin32_Init(m_hwnd);
@@ -311,7 +316,7 @@ void NanahiraGUI::DrawTitleBar() {
     ImGui::PopStyleColor();
     ImGui::SameLine(0.f, 8.f);
     ImGui::PushStyleColor(ImGuiCol_Text, kTextDim);
-    ImGui::Text("v3.0.0");
+    ImGui::Text("v%d.%d.%d", PROTO_VER_MAJOR, PROTO_VER_MINOR, PROTO_VER_PATCH);
     ImGui::PopStyleColor();
 
     float w = ImGui::GetWindowWidth();
@@ -641,8 +646,11 @@ void NanahiraGUI::DoInject() {
 
         const std::string& path = m_dllPaths[m_selectedDll];
         int sz = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+        if (sz <= 0) { AddToast("Invalid DLL path.", 239/255.f, 68/255.f, 68/255.f); return; }
         std::wstring wpath(sz, 0);
-        MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, wpath.data(), sz);
+        // &wpath[0] is writable in every C++ standard; wstring::data() only
+        // returns a mutable pointer since C++17.
+        MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, &wpath[0], sz);
 
         m_altJob    = new AltInjectJob{ m_mode, m_processes[m_selectedProc].pid, wpath, false };
         m_altThread = CreateThread(nullptr, 0, AltInjectWorker, m_altJob, 0, nullptr);

@@ -15,8 +15,9 @@ This guide walks you through building, loading, and using the Nanahira kernel ma
 ## 1. Build
 
 ### Prerequisites
-* **Rust & Cargo:** The build process uses a Rust PDB offset parser to dynamically resolve kernel offsets.
-* **WDK & SDK:** Ensure you have the matching Windows Driver Kit and SDK installed.
+* **Visual Studio 2026 Build Tools:** MSVC v145 (14.51) with the "Desktop development with C++" workload.
+* **WDK & SDK:** Windows Driver Kit / SDK 10.0.28000.0 (must match `WindowsTargetPlatformVersion` in both `.vcxproj` files).
+* **Kernel PDB:** `D:\Ameger\Mapper\Build\Symbols\ntkrnlmp.pdb` by default, or set `PDB_PATH`. `build_release.bat` verifies its GUID against the live `ntoskrnl.exe` before generating `driver\offsets.h`. Rust/Cargo is not required.
 
 To build the project automatically:
 
@@ -24,15 +25,17 @@ To build the project automatically:
 build_release.bat
 ```
 
-This runs the Rust PDB offset parser to generate `offsets.h`, executes the source mutation tool, compiles both projects under Visual Studio, restores the source files, and applies 10 binary PE mutations. The final outputs will be placed in the `output/` directory.
+This verifies the kernel PDB GUID, regenerates `driver\offsets.h`, applies source mutation, compiles both projects with MSVC v145, restores the source files, and applies 10 binary PE mutations. Outputs land in `output/`, alongside `offsets.buildinfo`.
 
-Alternatively, if you build manually inside Visual Studio 2022 under `Release | x64`, the Pre-Build Event will automatically run `cargo run --manifest-path "tools\pdb-parser\Cargo.toml" --release` to generate the correct offsets. Then execute `quick_spoof.bat` to apply the binary PE mutations.
+For a manual build, open `nanahira.sln` in Visual Studio 2026 Build Tools, select `Release | x64`, run `tools\dia-offsetgen\build_and_run.bat` first, then build, then run `quick_spoof.bat`.
 
 ---
 
 The driver (`driver.sys`) needs to be loaded into the kernel.
 
-### Option A: Test Signing (Recommended for Dev & Stability)
+### Option A: Test Signing (legacy — not used on this host)
+
+This path is retained for other machines. On this host VBS/HVCI/WDAC were disabled and the external mapper (Option B) is used instead.
 
 1. **One-time setup:** Run the following commands as Administrator and reboot your PC:
    ```batch
@@ -57,22 +60,18 @@ The driver (`driver.sys`) needs to be loaded into the kernel.
    sc start nanahira
    ```
 
-### Option B: Vulnerable Driver Mapping (BYOVD Bypass - No Test Signing Required)
+### Option B: External mapper (used on this host)
 
-For production environments where Test Signing mode cannot be enabled, use the custom `vuln-loader` tool to temporarily disable DSE (Driver Signature Enforcement) and load `driver.sys`.
+Test signing is not used. The driver is manually mapped with the mapper already staged at `D:\Ameger\Mapper`.
 
-1. **Prerequisite:** Download a signed copy of `RTCore64.sys` (MSI vulnerable driver).
-2. **Build the loader:**
+1. **Build** with `build_release.bat` (elevated). Output: `output\driver.sys`.
+2. **Map**, from an elevated shell:
    ```batch
-   cd tools\vuln-loader
-   cargo build --release
+   D:\Ameger\Mapper\Build\Release\Mapper.exe D:\Ameger\Nanahira\output\driver.sys
    ```
-3. **Execute the bypass:** Run as Administrator:
-   ```batch
-   target\release\vuln-loader.exe C:\path\to\RTCore64.sys C:\path\to\output\driver.sys
-   ```
+3. **Verify** with `output\nanahira.exe`.
 
-This will load `RTCore64.sys`, locate the `g_CiOptions` kernel variable, temporarily set it to `0` (DSE disabled), load the unsigned `driver.sys`, restore `g_CiOptions` back to its original value, and clean up the MSI driver.
+Do not run the mapper from this workspace shell; it requires elevation and is executed by the operator.
 
 ---
 

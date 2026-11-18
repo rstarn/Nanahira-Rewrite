@@ -11,12 +11,12 @@
 #define DISCORD_RPC_OPCODE_PING       3
 #define DISCORD_RPC_OPCODE_PONG       4
 
-#pragma pack(push, 1)
+// Two DWORD fields are naturally 8-byte aligned; no #pragma pack needed.
 typedef struct {
     DWORD opcode;
     DWORD length;
 } DiscordHeader;
-#pragma pack(pop)
+static_assert(sizeof(DiscordHeader) == 8, "Discord IPC header must be 8 bytes");
 
 static HANDLE   g_Pipe         = INVALID_HANDLE_VALUE;
 static char     g_AppId[64]    = { 0 };

@@ -1,4 +1,5 @@
-﻿@echo off
+@echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 
 
@@ -25,23 +26,27 @@ if %errorLevel% neq 0 (
 )
 echo  [+] Running as Administrator
 
-set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-if not exist "%VSWHERE%" (
-    echo  [x] Visual Studio 2022 not found!
-    echo  [x] Install VS2022 with "Desktop development with C++" workload
-    pause
-    exit /b 1
+rem  VS 18 (2026) Build Tools are not enumerated by the bundled vswhere 3.1.7.
+rem  Prefer the known install path, then fall back to vswhere for other hosts.
+rem  Cache PF86 outside the block: a literal (x86) in an expanded path breaks if-blocks.
+set "PF86=%ProgramFiles(x86)%"
+set "VSINSTALL=!PF86!\Microsoft Visual Studio\18\BuildTools"
+if not exist "!VSINSTALL!\VC\Auxiliary\Build\vcvars64.bat" (
+    set "VSWHERE=!PF86!\Microsoft Visual Studio\Installer\vswhere.exe"
+    set "VSINSTALL="
+    if exist "!VSWHERE!" (
+        for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -products * -property installationPath`) do set "VSINSTALL=%%i"
+    )
 )
-
-for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -property installationPath`) do set "VSINSTALL=%%i"
 
 if not defined VSINSTALL (
-    echo  [x] Could not locate Visual Studio installation
+    echo  [x] No usable C++ toolchain found.
+    echo  [x] Expected VS 2026 Build Tools with MSVC v145 + WDK 10.0.28000.0
     pause
     exit /b 1
 )
 
-echo  [+] VS2022: %VSINSTALL%
+echo  [+] Toolchain: %VSINSTALL%
 
 call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul 2>&1
 if %errorLevel% neq 0 (
@@ -53,7 +58,7 @@ echo  [+] Build environment loaded
 
 where pwsh >nul 2>&1
 if %errorLevel% neq 0 (
-    echo  [!] PowerShell 7 (pwsh) not found â€” source mutation will be skipped
+    echo  [!] PowerShell 7 ^(pwsh^) not found â€” source mutation will be skipped
     echo  [!] Install: winget install Microsoft.PowerShell
     set "HAS_PWSH=0"
 ) else (
@@ -68,7 +73,15 @@ echo.
 echo  â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 echo.
-echo  [1/5] Source-level mutation...
+call "%~dp0tools\dia-offsetgen\build_and_run.bat"
+if errorlevel 1 (
+    echo.
+    echo  [x] Offset generation FAILED - refusing to build with stale offsets
+    pause
+    exit /b 1
+)
+
+echo  [1/5] Kernel offsets + source-level mutation...
 echo  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if "%HAS_PWSH%"=="1" (
@@ -84,7 +97,7 @@ echo.
 echo  [2/5] Compiling driver.sys (kernel mode)...
 echo  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-msbuild "%~dp0nanahira.sln" /t:driver /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+msbuild "%~dp0nanahira.sln" /t:driver:Rebuild /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
 
 if %errorLevel% neq 0 (
     echo.
@@ -111,7 +124,7 @@ echo.
 echo  [3/5] Compiling nanahira.exe (usermode)...
 echo  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-msbuild "%~dp0nanahira.sln" /t:usermode /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+msbuild "%~dp0nanahira.sln" /t:usermode:Rebuild /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
 
 if %errorLevel% neq 0 (
     echo.
@@ -149,7 +162,8 @@ echo  [5/5] Binary PE mutation (10 mutations)...
 echo  â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
 if "%HAS_PWSH%"=="1" (
-    pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\signature_randomizer.ps1" -Files "%~dp0output\driver.sys","%~dp0output\nanahira.exe"
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\signature_randomizer.ps1" -Files "%~dp0output\driver.sys"
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\signature_randomizer.ps1" -Files "%~dp0output\nanahira.exe"
 ) else (
     echo  [!] Skipped â€” requires PowerShell 7
 )
@@ -176,7 +190,7 @@ echo    ^ nanahira.exe
 
 echo.
 echo  Next steps:
-echo    1. kdmapper.exe output\driver.sys
+echo    1. D:\Ameger\Mapper\Build\Release\Mapper.exe output\driver.sys (run elevated)
 echo    2. Launch target application
 echo    3. output\nanahira.exe ^<process^> ^<dll_path^>
 echo.

@@ -371,7 +371,16 @@ function Invoke-MutateBuildGUID([byte[]]$PE, [int]$NtOffset) {
     
     # Write GUID at the end of last section (overwrite last 16 bytes of padding)
     $guidOffset = $lastRawPtr + $lastRawSize - 16
+    # Only stamp genuine zero padding. Writing over initialized data would
+    # silently corrupt live constants (e.g. the IPC protocol magic) and break
+    # driver/usermode agreement.
+    $isPadding = $true
     if ($guidOffset -gt 0 -and ($guidOffset + 16) -le $PE.Length) {
+        for ($i = 0; $i -lt 16; $i++) {
+            if ($PE[$guidOffset + $i] -ne 0) { $isPadding = $false; break }
+        }
+    } else { $isPadding = $false }
+    if ($isPadding) {
         $guid = Get-RandomBytes 16
         [Array]::Copy($guid, 0, $PE, $guidOffset, 16)
         $guidStr = [BitConverter]::ToString($guid).Replace("-","")

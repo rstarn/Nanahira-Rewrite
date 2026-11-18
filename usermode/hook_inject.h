@@ -16,10 +16,16 @@ typedef struct _UNICODE_STRING {
 #pragma runtime_checks("", off)
 #pragma optimize("", off)
 
+// Sentinel values are compiled into the shellcode as 64-bit immediates and
+// patched by the injector before it is written to the target. Keeping them as
+// named constants means the scan pattern is generated from the same value.
+static constexpr uintptr_t kHookBaseSentinel = 0x15846254168ull;
+static constexpr uintptr_t kHookFlagSentinel = 0x24856841253ull;
+
 static void __stdcall HookShellcode()
 {
-    uintptr_t base      = 0x15846254168;
-    uintptr_t flag_addr = 0x24856841253;
+    uintptr_t base      = kHookBaseSentinel;
+    uintptr_t flag_addr = kHookFlagSentinel;
 
     *(volatile BYTE*)flag_addr = 0x69;
 
@@ -82,8 +88,10 @@ static void __stdcall HookShellcode()
         return nullptr;
     };
 
-    BYTE* k32  = findModule(0x6A4ABC5B);
-    BYTE* ntdl = findModule(0x1EDE3681);
+    // Hash with the same routine defined above; baked-in ROR13 hashes belong
+    // to a different algorithm and never matched this loader.
+    BYTE* k32  = findModule(hashStr(L"kernel32.dll"));
+    BYTE* ntdl = findModule(hashStr(L"ntdll.dll"));
 
     auto _LoadLibraryA    = (fn_LoadLibraryA)   findExport(k32,  "LoadLibraryA");
     auto _GetProcAddress  = (fn_GetProcAddress)  findExport(k32,  "GetProcAddress");
@@ -159,8 +167,24 @@ static inline PBYTE ScanPattern(PVOID imageBase, SIZE_T imageSize, const char* p
     return nullptr;
 }
 
-static inline int ScFunctionLength(void* fn) {
-    return (int)((BYTE*)HookShellcode_End - (BYTE*)fn);
+template <uintptr_t Sentinel>
+static inline bool PatchSentinel(BYTE* code, SIZE_T len, uintptr_t value)
+{
+    BYTE pat[sizeof(value)];
+    for (SIZE_T i = 0; i < sizeof(value); ++i)
+        pat[i] = (BYTE)(Sentinel >> (i * 8));
+
+    BYTE* at = ScanPattern(code, len, reinterpret_cast<const char*>(pat), "xxxxxxxx");
+    if (!at) return false;
+    memcpy(at, &value, sizeof(value));
+    return true;
+}
+
+static inline int ScFunctionLength(const void* fn) {
+    // Explicit casts avoid the MSVC "pointer-to-function -> pointer-to-object"
+    // extension warning while measuring the compiled shellcode body.
+    return (int)((const BYTE*)reinterpret_cast<const void*>(&HookShellcode_End)
+               - (const BYTE*)fn);
 }
 
 static inline void ApplySectionProtections(HANDLE hProc, BYTE* remoteBase, IMAGE_NT_HEADERS64* nt)
@@ -240,14 +264,14 @@ struct HookInjector {
             return false;
         }
 
-        int scLen = ScFunctionLength(&HookShellcode);
+        int scLen = ScFunctionLength(reinterpret_cast<const void*>(&HookShellcode));
         BYTE* scLocal = (BYTE*)VirtualAlloc(NULL, scLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        memcpy(scLocal, &HookShellcode, scLen);
+        memcpy(scLocal, reinterpret_cast<const void*>(&HookShellcode), scLen);
 
-        PBYTE pBase = ScanPattern(scLocal, scLen, "\x68\x41\x25\x46\x58\x01\x00\x00", "xxxxxx??");
-        PBYTE pFlag = ScanPattern(scLocal, scLen, "\x53\x12\x84\x56\x48\x02\x00\x00", "xxxxxx??");
+        bool patched = PatchSentinel<kHookBaseSentinel>(scLocal, scLen, (uintptr_t)remoteBase)
+                    && PatchSentinel<kHookFlagSentinel>(scLocal, scLen, (uintptr_t)flagBase);
 
-        if (!pBase || !pFlag) {
+        if (!patched) {
             VirtualFree(scLocal, 0, MEM_RELEASE);
             VirtualFreeEx(hProc, scRemote, 0, MEM_RELEASE);
             VirtualFreeEx(hProc, flagBase, 0, MEM_RELEASE);
@@ -256,9 +280,6 @@ struct HookInjector {
             CloseHandle(hProc);
             return false;
         }
-
-        *(uintptr_t*)pBase = (uintptr_t)remoteBase;
-        *(uintptr_t*)pFlag = (uintptr_t)flagBase;
 
         WriteProcessMemory(hProc, scRemote, scLocal, scLen, NULL);
         VirtualFree(scLocal, 0, MEM_RELEASE);

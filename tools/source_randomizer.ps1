@@ -88,7 +88,7 @@ Write-Host "  Mutations:" -ForegroundColor White
 Write-Host "  ──────────────────────────────────────────" -ForegroundColor DarkGray
 
 # 1. Shared memory section name (kernel-mode)
-$oldKmPattern = '(L"\\\\BaseNamedObjects\\\\Global\\\\)[^"]*(")'
+$oldKmPattern = '(L"\\\\BaseNamedObjects\\\\)[^"\\]+(")'
 $newKmValue = "`${1}$newSectionName`${2}"
 if ($content -match $oldKmPattern) {
     $content = $content -replace $oldKmPattern, $newKmValue

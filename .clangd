@@ -1,0 +1,44 @@
+# clangd configuration for Zed (and any other clangd-based editor).
+#
+# Most of the "64 errors" reported by the editor were not source defects:
+# clangd was invoked without the WDK / DIA SDK include paths, so ntifs.h and
+# dia2.h could not be found and every Windows type cascaded into an error.
+#
+# Keep these paths in sync with the versions pinned in the two .vcxproj files
+# (SDK/WDK 10.0.28000.0, MSVC v145). No compile_commands.json is needed.
+
+# Common flags for every C/C++ file in the project.
+If:
+  PathMatch: '.*'
+CompileFlags:
+  Add:
+    - -std=c++17
+    - -fms-extensions
+    - -fms-compatibility
+    - -fms-compatibility-version=19.40
+---
+# Kernel mapper + DIA offset generator: WDK (km/shared) and DIA SDK headers.
+If:
+  PathMatch: '.*(driver|dia-offsetgen).*'
+CompileFlags:
+  Add:
+    - -D_AMD64_
+    - -DAMD64
+    - -D_WIN64
+    - '-IC:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0\km'
+    - '-IC:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0\shared'
+    - '-IC:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\DIA SDK\include'
+    - -Ishared
+    - -Idriver
+---
+# Usermode injector / GUI: desktop Windows SDK (um/shared) headers.
+If:
+  PathMatch: '.*usermode.*'
+CompileFlags:
+  Add:
+    - -D_WIN32_WINNT=0x0A00
+    - '-IC:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0\um'
+    - '-IC:\Program Files (x86)\Windows Kits\10\Include\10.0.28000.0\shared'
+    - -Iusermode
+    - -Ishared
+    - -I.
